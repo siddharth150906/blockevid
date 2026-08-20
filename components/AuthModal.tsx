@@ -2,21 +2,23 @@
 
 import React, { useState, useEffect, useRef } from "react";
 import { useAuth } from "@/context/AuthContext";
-import { 
-  Shield, 
-  Lock, 
-  Mail, 
-  User, 
-  Phone, 
-  Briefcase, 
-  Building2, 
-  X, 
-  KeyRound, 
-  CheckCircle2, 
-  AlertCircle, 
-  ArrowRight, 
+import {
+  Shield,
+  Lock,
+  Mail,
+  User,
+  Phone,
+  Briefcase,
+  Building2,
+  X,
+  KeyRound,
+  CheckCircle2,
+  AlertCircle,
+  ArrowRight,
   RefreshCw,
-  Sparkles
+  Sparkles,
+  Clock,
+  ShieldAlert
 } from "lucide-react";
 
 export default function AuthModal() {
@@ -26,7 +28,6 @@ export default function AuthModal() {
     authModalTab,
     setAuthModalTab,
     pendingEmail,
-    devOtpHint,
     login,
     signup,
     verifyOtp,
@@ -49,9 +50,18 @@ export default function AuthModal() {
   const [signupAgency, setSignupAgency] = useState("Delhi Cyber Cell");
 
   // OTP form state
-  const [otpCode, setOtpCode] = useState("");
-  const [resendTimer, setResendTimer] = useState(60);
+  const [otpDigits, setOtpDigits] = useState<string[]>(["", "", "", "", "", ""]);
+  const otpInputRefs = useRef<(HTMLInputElement | null)[]>([]);
+
+  // Timers: 5-minute expiry (300s) and 60-second resend cooldown
+  const [expirySeconds, setExpirySeconds] = useState(300);
+  const [resendCooldown, setResendCooldown] = useState(60);
   const [canResend, setCanResend] = useState(false);
+  const [isOtpExpired, setIsOtpExpired] = useState(false);
+
+  // Attempt & Lockout tracking
+  const [attemptsRemaining, setAttemptsRemaining] = useState<number | null>(null);
+  const [isLocked, setIsLocked] = useState(false);
 
   // Complete profile state (for Google first-time users)
   const [profileName, setProfileName] = useState("");
@@ -66,13 +76,19 @@ export default function AuthModal() {
 
   const googleBtnRef = useRef<HTMLDivElement>(null);
 
-  // Sync state when tab changes
+  // Reset state when opening or switching tabs
   useEffect(() => {
     setErrorMessage(null);
     setSuccessMessage(null);
     if (authModalTab === "otp") {
-      setResendTimer(60);
+      setExpirySeconds(300);
+      setResendCooldown(60);
       setCanResend(false);
+      setIsOtpExpired(false);
+      setIsLocked(false);
+      setAttemptsRemaining(null);
+      setOtpDigits(["", "", "", "", "", ""]);
+      setTimeout(() => otpInputRefs.current[0]?.focus(), 100);
     }
     if (authModalTab === "complete-profile" && user) {
       setProfileName(user.name || "");
@@ -82,12 +98,30 @@ export default function AuthModal() {
     }
   }, [authModalTab, user]);
 
-  // Resend OTP countdown timer
+  // 5-Minute Expiration Timer
   useEffect(() => {
-    let interval: NodeJS.Timeout;
-    if (authModalTab === "otp" && resendTimer > 0) {
-      interval = setInterval(() => {
-        setResendTimer((prev) => {
+    let timer: NodeJS.Timeout;
+    if (authModalTab === "otp" && expirySeconds > 0 && !isOtpExpired) {
+      timer = setInterval(() => {
+        setExpirySeconds((prev) => {
+          if (prev <= 1) {
+            setIsOtpExpired(true);
+            setErrorMessage("Verification code has expired. Please click Resend OTP to request a fresh code.");
+            return 0;
+          }
+          return prev - 1;
+        });
+      }, 1000);
+    }
+    return () => clearInterval(timer);
+  }, [authModalTab, expirySeconds, isOtpExpired]);
+
+  // 60-Second Resend Cooldown Timer
+  useEffect(() => {
+    let cooldownTimer: NodeJS.Timeout;
+    if (authModalTab === "otp" && resendCooldown > 0) {
+      cooldownTimer = setInterval(() => {
+        setResendCooldown((prev) => {
           if (prev <= 1) {
             setCanResend(true);
             return 0;
@@ -96,15 +130,14 @@ export default function AuthModal() {
         });
       }, 1000);
     }
-    return () => clearInterval(interval);
-  }, [authModalTab, resendTimer]);
+    return () => clearInterval(cooldownTimer);
+  }, [authModalTab, resendCooldown]);
 
   // Render Google Identity Services Button if script is available
   useEffect(() => {
     if (!isAuthModalOpen) return;
     const clientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID;
 
-    // Check if google accounts script is loaded on window
     const win = window as any;
     if (win.google && win.google.accounts && clientId && !clientId.startsWith("your_google")) {
       try {
@@ -135,6 +168,51 @@ export default function AuthModal() {
 
   if (!isAuthModalOpen) return null;
 
+  // Format seconds into MM:SS
+  const formatTime = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
+  };
+
+  // OTP 6-Box Input Handlers
+  const handleDigitChange = (index: number, value: string) => {
+    const cleaned = value.replace(/\D/g, "");
+    if (!cleaned) {
+      const updated = [...otpDigits];
+      updated[index] = "";
+      setOtpDigits(updated);
+      return;
+    }
+
+    if (cleaned.length === 1) {
+      const updated = [...otpDigits];
+      updated[index] = cleaned;
+      setOtpDigits(updated);
+      if (index < 5) {
+        otpInputRefs.current[index + 1]?.focus();
+      }
+    } else if (cleaned.length > 1) {
+      // Pasted full 6-digit code
+      const updated = [...otpDigits];
+      const chars = cleaned.slice(0, 6).split("");
+      for (let i = 0; i < 6; i++) {
+        updated[i] = chars[i] || "";
+      }
+      setOtpDigits(updated);
+      const nextIndex = Math.min(chars.length, 5);
+      otpInputRefs.current[nextIndex]?.focus();
+    }
+  };
+
+  const handleKeyDown = (index: number, e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Backspace" && !otpDigits[index] && index > 0) {
+      otpInputRefs.current[index - 1]?.focus();
+    }
+  };
+
+  const fullOtpCode = otpDigits.join("");
+
   // Handle standard login
   const handleLoginSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -160,7 +238,7 @@ export default function AuthModal() {
       return;
     }
     if (!signupPhone.trim()) {
-      setErrorMessage("Official Phone Number is mandatory.");
+      setErrorMessage("Official Contact Phone Number is mandatory.");
       return;
     }
     if (!signupDesignation.trim()) {
@@ -185,6 +263,8 @@ export default function AuthModal() {
 
     if (!res.success && res.error) {
       setErrorMessage(res.error);
+    } else {
+      setSuccessMessage("A 6-digit verification code has been dispatched to your email via Resend.");
     }
   };
 
@@ -192,23 +272,48 @@ export default function AuthModal() {
   const handleOtpSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMessage(null);
+    setSuccessMessage(null);
 
-    if (!otpCode.trim() || otpCode.trim().length !== 6) {
-      setErrorMessage("Please enter the complete 6-digit verification code.");
+    if (fullOtpCode.length !== 6) {
+      setErrorMessage("Please enter the complete 6-digit code received on your email.");
+      return;
+    }
+
+    if (isOtpExpired) {
+      setErrorMessage("This verification code has expired. Please click Resend OTP.");
+      return;
+    }
+
+    if (isLocked) {
+      setErrorMessage("This code is locked due to too many failed attempts. Please request a new code.");
       return;
     }
 
     setIsSubmitting(true);
-    const res = await verifyOtp(pendingEmail || signupEmail || loginEmail, otpCode.trim());
+    const targetEmail = pendingEmail || signupEmail || loginEmail;
+    const res = await verifyOtp(targetEmail, fullOtpCode);
     setIsSubmitting(false);
 
-    if (!res.success && res.error) {
-      setErrorMessage(res.error);
+    if (!res.success) {
+      setErrorMessage(res.error || "Verification failed.");
+      if (res.attemptsRemaining !== undefined) {
+        setAttemptsRemaining(res.attemptsRemaining);
+      }
+      if (res.isLocked) {
+        setIsLocked(true);
+      }
+      if (res.isExpired) {
+        setIsOtpExpired(true);
+      }
+    } else {
+      setSuccessMessage("Email verified successfully! Authorizing officer access...");
     }
   };
 
   // Handle resend OTP
   const handleResendOtp = async () => {
+    if (!canResend && resendCooldown > 0) return;
+
     setErrorMessage(null);
     setSuccessMessage(null);
     setIsSubmitting(true);
@@ -218,11 +323,21 @@ export default function AuthModal() {
     setIsSubmitting(false);
 
     if (res.success) {
-      setSuccessMessage("A fresh verification code has been dispatched.");
-      setResendTimer(60);
+      setSuccessMessage("A fresh 6-digit verification code has been sent to your email.");
+      setExpirySeconds(300);
+      setResendCooldown(60);
       setCanResend(false);
+      setIsOtpExpired(false);
+      setIsLocked(false);
+      setAttemptsRemaining(null);
+      setOtpDigits(["", "", "", "", "", ""]);
+      setTimeout(() => otpInputRefs.current[0]?.focus(), 100);
     } else if (res.error) {
       setErrorMessage(res.error);
+      if (res.secondsRemaining) {
+        setResendCooldown(res.secondsRemaining);
+        setCanResend(false);
+      }
     }
   };
 
@@ -258,7 +373,7 @@ export default function AuthModal() {
     }
   };
 
-  // Quick Google Sign-in demo handler (works even without client id configuration)
+  // Quick Google Sign-in demo handler
   const handleQuickGoogleAuth = async () => {
     setIsSubmitting(true);
     setErrorMessage(null);
@@ -274,15 +389,15 @@ export default function AuthModal() {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-in fade-in duration-200">
       <div className="relative w-full max-w-lg bg-[#070c18] border border-zinc-800 rounded-2xl shadow-2xl overflow-hidden text-zinc-200">
-        
-        {/* Glow accent */}
+
+        {/* Glowing top accent line */}
         <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-emerald-500 via-teal-400 to-cyan-500" />
 
         {/* Close Button */}
         {authModalTab !== "complete-profile" && (
           <button
             onClick={closeAuthModal}
-            className="absolute top-4 right-4 p-2 text-zinc-400 hover:text-white rounded-lg hover:bg-zinc-800 transition-colors"
+            className="absolute top-4 right-4 p-2 text-zinc-400 hover:text-white rounded-lg hover:bg-zinc-800 transition-colors cursor-pointer"
           >
             <X className="h-5 w-5" />
           </button>
@@ -298,13 +413,13 @@ export default function AuthModal() {
               <h2 className="text-lg font-bold text-white tracking-tight flex items-center gap-2">
                 BlockEvid Officer Portal
                 <span className="text-[10px] uppercase font-mono tracking-widest bg-emerald-500/15 text-emerald-400 px-2 py-0.5 border border-emerald-500/20 rounded">
-                  AUTHENTICATED LEDGER
+                  JUDICIAL SECURITY
                 </span>
               </h2>
               <p className="text-xs text-zinc-400 mt-0.5">
                 {authModalTab === "login" && "Authorize your investigator credentials to access the chain of custody."}
                 {authModalTab === "signup" && "Register your officer credentials. Mandatory email OTP verification required."}
-                {authModalTab === "otp" && "Enter the 6-digit cryptographic OTP sent to your email."}
+                {authModalTab === "otp" && "Verify your registered email address with the 6-digit cryptographic code sent to your inbox."}
                 {authModalTab === "complete-profile" && "Mandatory Officer Profile: Submit your Phone & Designation to proceed."}
               </p>
             </div>
@@ -319,11 +434,10 @@ export default function AuthModal() {
                   setErrorMessage(null);
                   setAuthModalTab("login");
                 }}
-                className={`py-2 px-3 rounded-lg font-semibold transition-all ${
-                  authModalTab === "login"
+                className={`py-2 px-3 rounded-lg font-semibold transition-all cursor-pointer ${authModalTab === "login"
                     ? "bg-emerald-500 text-black shadow-lg shadow-emerald-500/20 font-bold"
                     : "text-zinc-400 hover:text-white"
-                }`}
+                  }`}
               >
                 Log In
               </button>
@@ -333,11 +447,10 @@ export default function AuthModal() {
                   setErrorMessage(null);
                   setAuthModalTab("signup");
                 }}
-                className={`py-2 px-3 rounded-lg font-semibold transition-all ${
-                  authModalTab === "signup"
+                className={`py-2 px-3 rounded-lg font-semibold transition-all cursor-pointer ${authModalTab === "signup"
                     ? "bg-emerald-500 text-black shadow-lg shadow-emerald-500/20 font-bold"
                     : "text-zinc-400 hover:text-white"
-                }`}
+                  }`}
               >
                 Sign Up
               </button>
@@ -347,20 +460,20 @@ export default function AuthModal() {
 
         {/* Modal Body */}
         <div className="p-6 space-y-4 max-h-[75vh] overflow-y-auto">
-          
+
           {/* Error Alert */}
           {errorMessage && (
-            <div className="flex items-start gap-2.5 p-3.5 bg-red-500/10 border border-red-500/30 rounded-xl text-red-400 text-xs font-mono">
+            <div className="flex items-start gap-2.5 p-3.5 bg-red-500/10 border border-red-500/30 rounded-xl text-red-400 text-xs font-mono animate-in fade-in">
               <AlertCircle className="h-4 w-4 flex-shrink-0 mt-0.5" />
-              <div>{errorMessage}</div>
+              <div className="flex-1">{errorMessage}</div>
             </div>
           )}
 
           {/* Success Alert */}
           {successMessage && (
-            <div className="flex items-start gap-2.5 p-3.5 bg-emerald-500/10 border border-emerald-500/30 rounded-xl text-emerald-400 text-xs font-mono">
+            <div className="flex items-start gap-2.5 p-3.5 bg-emerald-500/10 border border-emerald-500/30 rounded-xl text-emerald-400 text-xs font-mono animate-in fade-in">
               <CheckCircle2 className="h-4 w-4 flex-shrink-0 mt-0.5" />
-              <div>{successMessage}</div>
+              <div className="flex-1">{successMessage}</div>
             </div>
           )}
 
@@ -422,7 +535,7 @@ export default function AuthModal() {
               {/* Google OAuth Button */}
               <div className="space-y-2">
                 <div ref={googleBtnRef} className="flex justify-center" />
-                
+
                 <button
                   type="button"
                   onClick={handleQuickGoogleAuth}
@@ -456,7 +569,7 @@ export default function AuthModal() {
                 <button
                   type="button"
                   onClick={() => setAuthModalTab("signup")}
-                  className="text-emerald-400 hover:underline font-semibold"
+                  className="text-emerald-400 hover:underline font-semibold cursor-pointer"
                 >
                   Register here
                 </button>
@@ -469,11 +582,11 @@ export default function AuthModal() {
           {/* ============================== */}
           {authModalTab === "signup" && (
             <form onSubmit={handleSignupSubmit} className="space-y-3.5">
-              
+
               {/* Mandatory Notice */}
               <div className="bg-emerald-500/5 border border-emerald-500/20 rounded-xl p-3 text-[11px] font-mono text-emerald-400/90 flex items-center gap-2">
                 <Sparkles className="h-4 w-4 flex-shrink-0" />
-                <span>All officer fields (Name, Phone, Designation) are mandatory for judicial audit logging.</span>
+                <span>All officer fields (Name, Phone, Designation) are mandatory for judicial chain of custody audits.</span>
               </div>
 
               {/* Name (Mandatory) */}
@@ -642,7 +755,7 @@ export default function AuthModal() {
                 <button
                   type="button"
                   onClick={() => setAuthModalTab("login")}
-                  className="text-emerald-400 hover:underline font-semibold"
+                  className="text-emerald-400 hover:underline font-semibold cursor-pointer"
                 >
                   Log in here
                 </button>
@@ -654,87 +767,121 @@ export default function AuthModal() {
           {/* 3. OTP VERIFICATION TAB        */}
           {/* ============================== */}
           {authModalTab === "otp" && (
-            <form onSubmit={handleOtpSubmit} className="space-y-4">
+            <form onSubmit={handleOtpSubmit} className="space-y-5">
+
+              {/* Header Box */}
               <div className="p-4 bg-[#040711] border border-zinc-800 rounded-xl text-center space-y-2 font-mono">
                 <div className="w-10 h-10 mx-auto rounded-full bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
                   <Mail className="h-5 w-5" />
                 </div>
+                <div className="text-sm font-bold text-white">
+                  Verify Your Email
+                </div>
                 <div className="text-xs text-zinc-400">
-                  A verification code has been dispatched to:
-                </div>
-                <div className="text-sm font-bold text-white break-all">
-                  {pendingEmail || signupEmail || loginEmail}
+                  A 6-digit code has been sent via Resend to: <br />
+                  <span className="text-emerald-400 font-bold break-all mt-1 inline-block">{pendingEmail || signupEmail || loginEmail}</span>
                 </div>
               </div>
 
-              {/* Dev OTP Helper Box for seamless testing */}
-              {devOtpHint && (
-                <div className="p-3 bg-emerald-500/10 border border-emerald-500/30 rounded-xl flex items-center justify-between text-xs font-mono">
-                  <span className="text-emerald-400">
-                    💡 <strong>Test OTP Code:</strong> <span className="font-bold text-white tracking-widest">{devOtpHint}</span>
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => setOtpCode(devOtpHint)}
-                    className="px-2 py-1 bg-emerald-500 text-black font-bold rounded hover:bg-emerald-400 transition-colors"
-                  >
-                    Auto Fill
-                  </button>
-                </div>
-              )}
+              {/* 6 Individual Digit Inputs */}
+              <div className="space-y-3">
+                <div className="flex justify-between items-center px-1">
+                  <label className="text-xs font-mono text-zinc-400">
+                    Enter 6-Digit Code
+                  </label>
 
-              <div className="space-y-2">
-                <label className="text-xs font-mono text-zinc-400 block text-center">
-                  Enter 6-Digit Cryptographic Code
-                </label>
-                <input
-                  type="text"
-                  maxLength={6}
-                  value={otpCode}
-                  onChange={(e) => setOtpCode(e.target.value.replace(/\D/g, ""))}
-                  placeholder="123456"
-                  className="w-full text-center tracking-[1em] text-2xl font-mono font-bold bg-[#040711] border border-zinc-800 rounded-xl p-3.5 text-emerald-400 placeholder-zinc-700 focus:outline-none focus:border-emerald-500 transition-colors"
-                  required
-                  autoFocus
-                />
+                  {/* 5-Minute Expiry Countdown */}
+                  <div className={`text-xs font-mono flex items-center gap-1.5 font-semibold ${isOtpExpired ? "text-red-400" : expirySeconds < 60 ? "text-amber-400 animate-pulse" : "text-emerald-400"
+                    }`}>
+                    <Clock className="h-3.5 w-3.5" />
+                    <span>
+                      {isOtpExpired ? "Expired" : `Expires in: ${formatTime(expirySeconds)}`}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="flex justify-between gap-2 sm:gap-3">
+                  {otpDigits.map((digit, i) => (
+                    <input
+                      key={i}
+                      ref={(el) => { otpInputRefs.current[i] = el; }}
+                      type="text"
+                      inputMode="numeric"
+                      maxLength={6}
+                      disabled={isLocked || isOtpExpired}
+                      value={digit}
+                      onChange={(e) => handleDigitChange(i, e.target.value)}
+                      onKeyDown={(e) => handleKeyDown(i, e)}
+                      className={`w-12 h-14 sm:w-14 sm:h-16 text-center text-2xl font-mono font-bold rounded-xl border transition-all focus:outline-none ${isLocked
+                          ? "bg-red-950/20 border-red-500/40 text-red-400 cursor-not-allowed"
+                          : isOtpExpired
+                            ? "bg-zinc-900/40 border-zinc-800 text-zinc-600 cursor-not-allowed"
+                            : digit
+                              ? "bg-[#060e1e] border-emerald-500 text-emerald-400 shadow-lg shadow-emerald-500/10"
+                              : "bg-[#040711] border-zinc-800 text-white focus:border-emerald-500 focus:bg-[#060e1e]"
+                        }`}
+                      autoFocus={i === 0}
+                    />
+                  ))}
+                </div>
+
+                {/* Remaining Attempts Warning */}
+                {attemptsRemaining !== null && attemptsRemaining > 0 && !isLocked && (
+                  <div className="text-xs font-mono text-amber-400 flex items-center justify-center gap-1.5 pt-1">
+                    <ShieldAlert className="h-4 w-4" />
+                    <span>{attemptsRemaining} verification attempt(s) remaining</span>
+                  </div>
+                )}
+
+                {/* Locked Out Alert */}
+                {isLocked && (
+                  <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-xl text-xs font-mono text-red-400 text-center space-y-1">
+                    <div className="font-bold">🔒 Code Locked Out</div>
+                    <div>Too many failed verification attempts. Please click Resend OTP to get a new code.</div>
+                  </div>
+                )}
               </div>
 
+              {/* Verify Button */}
               <button
                 type="submit"
-                disabled={isSubmitting || otpCode.length !== 6}
-                className="w-full py-3 bg-emerald-500 hover:bg-emerald-400 disabled:bg-zinc-800 disabled:text-zinc-500 rounded-xl font-mono text-sm font-bold text-black flex items-center justify-center gap-2 transition-all shadow-lg shadow-emerald-500/10 cursor-pointer"
+                disabled={isSubmitting || fullOtpCode.length !== 6 || isLocked || isOtpExpired}
+                className="w-full py-3 bg-emerald-500 hover:bg-emerald-400 disabled:bg-zinc-800 disabled:text-zinc-600 rounded-xl font-mono text-sm font-bold text-black flex items-center justify-center gap-2 transition-all shadow-lg shadow-emerald-500/10 cursor-pointer"
               >
                 {isSubmitting ? (
                   <RefreshCw className="h-4 w-4 animate-spin" />
                 ) : (
                   <>
                     <CheckCircle2 className="h-4 w-4" />
-                    Verify Officer Credentials
+                    Verify OTP & Mint Access
                   </>
                 )}
               </button>
 
-              <div className="flex items-center justify-between text-xs font-mono pt-2">
+              {/* Footer Links & 60s Resend Cooldown */}
+              <div className="flex items-center justify-between text-xs font-mono pt-1">
                 <button
                   type="button"
                   onClick={() => setAuthModalTab("signup")}
-                  className="text-zinc-500 hover:text-zinc-300"
+                  className="text-zinc-500 hover:text-zinc-300 transition-colors cursor-pointer"
                 >
                   ← Change Email
                 </button>
 
-                <button
-                  type="button"
-                  onClick={handleResendOtp}
-                  disabled={!canResend || isSubmitting}
-                  className={`font-semibold transition-colors ${
-                    canResend
-                      ? "text-emerald-400 hover:underline cursor-pointer"
-                      : "text-zinc-600 cursor-not-allowed"
-                  }`}
-                >
-                  {canResend ? "Resend Code" : `Resend in ${resendTimer}s`}
-                </button>
+                <div className="text-right">
+                  <span className="text-zinc-500 block text-[11px]">Didn't receive it?</span>
+                  <button
+                    type="button"
+                    onClick={handleResendOtp}
+                    disabled={!canResend || isSubmitting}
+                    className={`font-semibold transition-colors cursor-pointer ${canResend
+                        ? "text-emerald-400 hover:underline"
+                        : "text-zinc-600 cursor-not-allowed"
+                      }`}
+                  >
+                    {canResend ? "Resend OTP" : `Resend in ${resendCooldown}s`}
+                  </button>
+                </div>
               </div>
             </form>
           )}

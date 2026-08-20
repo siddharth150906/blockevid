@@ -17,16 +17,32 @@ export interface OfficerUser {
 
 export type AuthModalTab = "login" | "signup" | "otp" | "complete-profile";
 
+export interface VerifyOtpResult {
+  success: boolean;
+  error?: string;
+  message?: string;
+  attemptsRemaining?: number;
+  isLocked?: boolean;
+  isExpired?: boolean;
+}
+
+export interface ResendOtpResult {
+  success: boolean;
+  error?: string;
+  message?: string;
+  secondsRemaining?: number;
+}
+
 interface AuthContextType {
   user: OfficerUser | null;
   isLoading: boolean;
   isAuthModalOpen: boolean;
   authModalTab: AuthModalTab;
   pendingEmail: string;
-  devOtpHint: string | null;
   openAuthModal: (tab?: AuthModalTab, email?: string) => void;
   closeAuthModal: () => void;
   setAuthModalTab: (tab: AuthModalTab) => void;
+  setPendingEmail: (email: string) => void;
   login: (email: string, password: string) => Promise<{ success: boolean; error?: string; requiresOtp?: boolean }>;
   signup: (data: {
     name: string;
@@ -35,9 +51,10 @@ interface AuthContextType {
     phone: string;
     designation: string;
     agency?: string;
-  }) => Promise<{ success: boolean; error?: string; devOtp?: string }>;
-  verifyOtp: (email: string, otp: string) => Promise<{ success: boolean; error?: string }>;
-  resendOtp: (email: string) => Promise<{ success: boolean; error?: string; devOtp?: string }>;
+  }) => Promise<{ success: boolean; error?: string }>;
+  sendOtp: (email: string, name?: string) => Promise<{ success: boolean; error?: string; secondsRemaining?: number }>;
+  verifyOtp: (email: string, otp: string) => Promise<VerifyOtpResult>;
+  resendOtp: (email: string) => Promise<ResendOtpResult>;
   loginWithGoogle: (credential?: string, testEmail?: string, testName?: string) => Promise<{ success: boolean; error?: string; needsProfileCompletion?: boolean }>;
   completeProfile: (data: {
     name: string;
@@ -57,7 +74,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [authModalTab, setAuthModalTab] = useState<AuthModalTab>("login");
   const [pendingEmail, setPendingEmail] = useState("");
-  const [devOtpHint, setDevOtpHint] = useState<string | null>(null);
 
   const fetchCurrentUser = useCallback(async () => {
     try {
@@ -113,11 +129,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (!res.ok) {
         if (data.requiresOtp) {
           setPendingEmail(email);
-          if (data.devOtp) setDevOtpHint(data.devOtp);
           setAuthModalTab("otp");
           return { success: false, requiresOtp: true, error: data.message };
         }
-        return { success: false, error: data.error || "Login failed." };
+        return { success: false, error: data.error || data.message || "Login failed." };
       }
 
       setUser(data.user);
@@ -145,20 +160,44 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       const result = await res.json();
 
-      if (!res.ok) {
-        return { success: false, error: result.error || "Signup failed." };
+      if (!res.ok || !result.success) {
+        return { success: false, error: result.message || result.error || "Signup failed." };
       }
 
       setPendingEmail(data.email);
-      if (result.devOtp) setDevOtpHint(result.devOtp);
       setAuthModalTab("otp");
-      return { success: true, devOtp: result.devOtp };
+      return { success: true };
     } catch (err: any) {
       return { success: false, error: err.message || "Network error occurred." };
     }
   };
 
-  const verifyOtp = async (email: string, otp: string) => {
+  const sendOtp = async (email: string, name?: string) => {
+    try {
+      const res = await fetch("/api/auth/send-otp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, name }),
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        return {
+          success: false,
+          error: data.message || "Failed to send verification code.",
+          secondsRemaining: data.secondsRemaining,
+        };
+      }
+
+      setPendingEmail(email);
+      setAuthModalTab("otp");
+      return { success: true };
+    } catch (err: any) {
+      return { success: false, error: err.message || "Network error occurred." };
+    }
+  };
+
+  const verifyOtp = async (email: string, otp: string): Promise<VerifyOtpResult> => {
     try {
       const res = await fetch("/api/auth/verify-otp", {
         method: "POST",
@@ -168,20 +207,29 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       const data = await res.json();
 
-      if (!res.ok) {
-        return { success: false, error: data.error || "Verification failed." };
+      if (!res.ok || !data.success) {
+        return {
+          success: false,
+          error: data.message || "Verification failed.",
+          attemptsRemaining: data.attemptsRemaining,
+          isLocked: data.isLocked,
+          isExpired: data.isExpired,
+        };
       }
 
-      setUser(data.user);
-      setDevOtpHint(null);
+      if (data.user) {
+        setUser(data.user);
+      } else {
+        await fetchCurrentUser();
+      }
       setIsAuthModalOpen(false);
-      return { success: true };
+      return { success: true, message: data.message };
     } catch (err: any) {
       return { success: false, error: err.message || "Network error occurred." };
     }
   };
 
-  const resendOtp = async (email: string) => {
+  const resendOtp = async (email: string): Promise<ResendOtpResult> => {
     try {
       const res = await fetch("/api/auth/resend-otp", {
         method: "POST",
@@ -190,12 +238,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       });
 
       const data = await res.json();
-      if (!res.ok) {
-        return { success: false, error: data.error || "Resend failed." };
+      if (!res.ok || !data.success) {
+        return {
+          success: false,
+          error: data.message || "Resend failed.",
+          secondsRemaining: data.secondsRemaining,
+        };
       }
 
-      if (data.devOtp) setDevOtpHint(data.devOtp);
-      return { success: true, devOtp: data.devOtp };
+      return { success: true, message: data.message };
     } catch (err: any) {
       return { success: false, error: err.message || "Network error occurred." };
     }
@@ -261,7 +312,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     try {
       await fetch("/api/auth/logout", { method: "POST" });
       setUser(null);
-      setDevOtpHint(null);
     } catch (err) {
       console.error("Logout error:", err);
       setUser(null);
@@ -276,12 +326,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         isAuthModalOpen,
         authModalTab,
         pendingEmail,
-        devOtpHint,
         openAuthModal,
         closeAuthModal,
         setAuthModalTab,
+        setPendingEmail,
         login,
         signup,
+        sendOtp,
         verifyOtp,
         resendOtp,
         loginWithGoogle,

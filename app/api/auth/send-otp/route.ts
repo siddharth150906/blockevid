@@ -1,11 +1,11 @@
 import { NextResponse } from "next/server";
-import { findUserByEmail, createSecureOtp, checkOtpCooldown } from "@/lib/db";
+import { createSecureOtp, checkOtpCooldown } from "@/lib/db";
 import { generateSecureOTP, hashOTP, sendOtpEmail } from "@/lib/email";
 
 export async function POST(req: Request) {
   try {
     const body = await req.json();
-    const { email } = body;
+    const { email, name } = body;
 
     if (!email || typeof email !== "string" || !email.includes("@")) {
       return NextResponse.json(
@@ -15,16 +15,8 @@ export async function POST(req: Request) {
     }
 
     const normalizedEmail = email.trim().toLowerCase();
-    const user = await findUserByEmail(normalizedEmail);
 
-    if (user && user.is_email_verified) {
-      return NextResponse.json(
-        { success: false, message: "This officer account is already verified. Please log in directly." },
-        { status: 400 }
-      );
-    }
-
-    // Enforce 60-second cooldown rate limit
+    // Check 60-second cooldown rate limit
     const cooldown = await checkOtpCooldown(normalizedEmail, "SIGNUP_VERIFY", 60);
     if (cooldown.inCooldown) {
       return NextResponse.json(
@@ -37,15 +29,15 @@ export async function POST(req: Request) {
       );
     }
 
-    // Generate fresh secure 6-digit OTP
+    // Generate cryptographically secure 6-digit OTP
     const otp = generateSecureOTP();
     const otpHash = hashOTP(otp, normalizedEmail);
 
-    // Save in DB with 5-minute expiration
+    // Store in DB with 5-minute expiration
     await createSecureOtp(normalizedEmail, otpHash, "SIGNUP_VERIFY", 5);
 
     // Dispatch email via Resend
-    const emailResult = await sendOtpEmail(normalizedEmail, otp, user?.name);
+    const emailResult = await sendOtpEmail(normalizedEmail, otp, name);
 
     if (!emailResult.success) {
       return NextResponse.json(
@@ -59,14 +51,14 @@ export async function POST(req: Request) {
 
     return NextResponse.json({
       success: true,
-      message: `A fresh 6-digit code has been dispatched to ${normalizedEmail}.`,
+      message: `A 6-digit verification code has been sent to ${normalizedEmail}.`,
       email: normalizedEmail,
       expiresInMinutes: 5,
     });
   } catch (err: any) {
-    console.error("[BlockEvid Resend OTP API Error]:", err);
+    console.error("[BlockEvid Send-OTP API Error]:", err);
     return NextResponse.json(
-      { success: false, message: "Failed to resend verification code. Please try again." },
+      { success: false, message: "Unable to send OTP. Please try again." },
       { status: 500 }
     );
   }

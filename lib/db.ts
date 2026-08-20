@@ -1,5 +1,6 @@
 import { Pool } from "pg";
 import crypto from "crypto";
+import { verifyOTPHash } from "./email";
 
 // Database interface types
 export interface UserRecord {
@@ -20,9 +21,10 @@ export interface UserRecord {
 export interface OtpRecord {
   id: string;
   email: string;
-  otp_code: string;
+  otp_hash: string;
   type: string;
   expires_at: Date | string;
+  attempts: number;
   is_used: boolean;
   created_at: Date | string;
 }
@@ -79,7 +81,7 @@ export async function initDb(): Promise<boolean> {
 
   const currentPool = getPool();
   if (!currentPool) {
-    console.info("[BlockEvid DB] No DATABASE_URL provided. Operating with in-memory resilient storage.");
+    console.info("[BlockEvid DB] Operating with in-memory resilient storage (DATABASE_URL not connected).");
     isPgAvailable = false;
     isInitialized = true;
     return false;
@@ -108,9 +110,10 @@ export async function initDb(): Promise<boolean> {
         CREATE TABLE IF NOT EXISTS otps (
           id VARCHAR(64) PRIMARY KEY,
           email VARCHAR(255) NOT NULL,
-          otp_code VARCHAR(10) NOT NULL,
+          otp_hash VARCHAR(255) NOT NULL,
           type VARCHAR(50) DEFAULT 'SIGNUP_VERIFY',
           expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+          attempts INTEGER DEFAULT 0,
           is_used BOOLEAN DEFAULT FALSE,
           created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );
@@ -123,8 +126,12 @@ export async function initDb(): Promise<boolean> {
           created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );
 
+        -- Safe column migrations for existing databases
+        ALTER TABLE otps ADD COLUMN IF NOT EXISTS otp_hash VARCHAR(255);
+        ALTER TABLE otps ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0;
+
         CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-        CREATE INDEX IF NOT EXISTS idx_otps_email ON otps(email);
+        CREATE INDEX IF NOT EXISTS idx_otps_email_type ON otps(email, type);
         CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token);
       `);
       isPgAvailable = true;
@@ -135,7 +142,7 @@ export async function initDb(): Promise<boolean> {
       client.release();
     }
   } catch (err: any) {
-    console.warn(`[BlockEvid DB] PostgreSQL connection failed (${err.message}). Using in-memory storage fallback.`);
+    console.warn(`[BlockEvid DB] PostgreSQL connection notice (${err.message}). Using in-memory storage fallback.`);
     isPgAvailable = false;
     isInitialized = true;
     return false;
@@ -310,8 +317,72 @@ export async function updateUser(
   return updated;
 }
 
-// OTP Queries
-export async function createOtp(email: string, otp_code: string, type = "SIGNUP_VERIFY", expiresInMinutes = 10): Promise<OtpRecord> {
+// =========================================================================
+// Secure OTP Queries & Operations
+// =========================================================================
+
+/**
+ * Checks if the email is within the 60-second resend cooldown window.
+ */
+export async function checkOtpCooldown(
+  email: string,
+  type = "SIGNUP_VERIFY",
+  cooldownSeconds = 60
+): Promise<{ inCooldown: boolean; secondsRemaining: number }> {
+  await initDb();
+  const normalizedEmail = email.trim().toLowerCase();
+  const now = Date.now();
+
+  let latestCreatedAt: number | null = null;
+
+  if (isPgAvailable && pool) {
+    try {
+      const res = await pool.query<{ created_at: Date }>(
+        `SELECT created_at FROM otps 
+         WHERE LOWER(email) = LOWER($1) AND type = $2 
+         ORDER BY created_at DESC LIMIT 1`,
+        [normalizedEmail, type]
+      );
+      if (res.rows.length > 0) {
+        latestCreatedAt = new Date(res.rows[0].created_at).getTime();
+      }
+    } catch (err) {
+      console.error("DB error in checkOtpCooldown:", err);
+    }
+  } else {
+    for (const item of memoryStore.otps.values()) {
+      if (item.email.toLowerCase() === normalizedEmail && item.type === type) {
+        const itemTime = new Date(item.created_at).getTime();
+        if (!latestCreatedAt || itemTime > latestCreatedAt) {
+          latestCreatedAt = itemTime;
+        }
+      }
+    }
+  }
+
+  if (latestCreatedAt) {
+    const elapsedSeconds = Math.floor((now - latestCreatedAt) / 1000);
+    if (elapsedSeconds < cooldownSeconds) {
+      return {
+        inCooldown: true,
+        secondsRemaining: cooldownSeconds - elapsedSeconds,
+      };
+    }
+  }
+
+  return { inCooldown: false, secondsRemaining: 0 };
+}
+
+/**
+ * Store a new hashed OTP with a 5-minute expiration time.
+ * Automatically invalidates previous unused OTPs for this email.
+ */
+export async function createSecureOtp(
+  email: string,
+  otpHash: string,
+  type = "SIGNUP_VERIFY",
+  expiresInMinutes = 5
+): Promise<OtpRecord> {
   await initDb();
   const id = crypto.randomUUID();
   const now = new Date();
@@ -321,34 +392,35 @@ export async function createOtp(email: string, otp_code: string, type = "SIGNUP_
   const otpRecord: OtpRecord = {
     id,
     email: normalizedEmail,
-    otp_code,
+    otp_hash: otpHash,
     type,
     expires_at,
+    attempts: 0,
     is_used: false,
     created_at: now,
   };
 
   if (isPgAvailable && pool) {
     try {
-      // Invalidate previous OTPs of this type for this email
+      // Invalidate previous unused OTPs for this email and type
       await pool.query(
         "UPDATE otps SET is_used = TRUE WHERE LOWER(email) = LOWER($1) AND type = $2 AND is_used = FALSE",
         [normalizedEmail, type]
       );
 
       const res = await pool.query<OtpRecord>(
-        `INSERT INTO otps (id, email, otp_code, type, expires_at, is_used, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+        `INSERT INTO otps (id, email, otp_hash, type, expires_at, attempts, is_used, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          RETURNING *`,
-        [id, normalizedEmail, otp_code, type, expires_at, false, now]
+        [id, normalizedEmail, otpHash, type, expires_at, 0, false, now]
       );
       return res.rows[0];
     } catch (err) {
-      console.error("DB error in createOtp:", err);
+      console.error("DB error in createSecureOtp:", err);
     }
   }
 
-  // Invalidate previous OTPs in memory
+  // Invalidate previous in-memory OTPs
   for (const [key, item] of memoryStore.otps.entries()) {
     if (item.email.toLowerCase() === normalizedEmail && item.type === type) {
       item.is_used = true;
@@ -360,49 +432,148 @@ export async function createOtp(email: string, otp_code: string, type = "SIGNUP_
   return otpRecord;
 }
 
-export async function verifyAndConsumeOtp(email: string, otp_code: string, type = "SIGNUP_VERIFY"): Promise<boolean> {
+/**
+ * Verifies the entered OTP against the stored hash.
+ * Enforces:
+ * - 5-minute expiration
+ * - Maximum 5 attempts
+ * - Immediate invalidation upon successful verification
+ */
+export async function verifySecureOtp(
+  email: string,
+  otp: string,
+  type = "SIGNUP_VERIFY"
+): Promise<{
+  valid: boolean;
+  error?: string;
+  attemptsRemaining?: number;
+  isLocked?: boolean;
+  isExpired?: boolean;
+}> {
   await initDb();
   const normalizedEmail = email.trim().toLowerCase();
   const now = new Date();
+  const MAX_ATTEMPTS = 5;
+
+  let activeRecord: OtpRecord | null = null;
 
   if (isPgAvailable && pool) {
     try {
       const res = await pool.query<OtpRecord>(
         `SELECT * FROM otps 
          WHERE LOWER(email) = LOWER($1) 
-           AND otp_code = $2 
-           AND type = $3 
+           AND type = $2 
            AND is_used = FALSE 
-           AND expires_at > $4 
          ORDER BY created_at DESC 
          LIMIT 1`,
-        [normalizedEmail, otp_code.trim(), type, now]
+        [normalizedEmail, type]
       );
-
       if (res.rows.length > 0) {
-        const matched = res.rows[0];
-        await pool.query("UPDATE otps SET is_used = TRUE WHERE id = $1", [matched.id]);
-        return true;
+        activeRecord = res.rows[0];
       }
-      return false;
     } catch (err) {
-      console.error("DB error in verifyAndConsumeOtp:", err);
+      console.error("DB error fetching OTP:", err);
+    }
+  } else {
+    // Memory store lookup
+    for (const item of memoryStore.otps.values()) {
+      if (item.email.toLowerCase() === normalizedEmail && item.type === type && !item.is_used) {
+        if (!activeRecord || new Date(item.created_at) > new Date(activeRecord.created_at)) {
+          activeRecord = item;
+        }
+      }
     }
   }
 
-  for (const [key, item] of memoryStore.otps.entries()) {
-    if (
-      item.email.toLowerCase() === normalizedEmail &&
-      item.otp_code === otp_code.trim() &&
-      item.type === type &&
-      !item.is_used &&
-      new Date(item.expires_at).getTime() > now.getTime()
-    ) {
+  if (!activeRecord) {
+    return {
+      valid: false,
+      error: "No active verification code found. Please request a new code.",
+    };
+  }
+
+  // Check 5-minute expiration
+  if (new Date(activeRecord.expires_at).getTime() <= now.getTime()) {
+    // Invalidate expired record
+    await markOtpUsed(activeRecord.id);
+    return {
+      valid: false,
+      error: "Verification code has expired (5-minute limit). Please request a new code.",
+      isExpired: true,
+    };
+  }
+
+  // Check if maximum attempts already exceeded
+  if (activeRecord.attempts >= MAX_ATTEMPTS) {
+    await markOtpUsed(activeRecord.id);
+    return {
+      valid: false,
+      error: "Maximum verification attempts exceeded. This code has been locked. Please request a new code.",
+      isLocked: true,
+      attemptsRemaining: 0,
+    };
+  }
+
+  // Increment attempt counter in DB
+  const newAttempts = activeRecord.attempts + 1;
+  await updateOtpAttempts(activeRecord.id, newAttempts);
+
+  // Check OTP Hash match
+  const isMatch = verifyOTPHash(otp, normalizedEmail, activeRecord.otp_hash);
+
+  if (isMatch) {
+    // Success: invalidate OTP immediately so it cannot be reused
+    await markOtpUsed(activeRecord.id);
+    return { valid: true };
+  }
+
+  // Mismatch handling
+  const attemptsRemaining = MAX_ATTEMPTS - newAttempts;
+  if (attemptsRemaining <= 0) {
+    await markOtpUsed(activeRecord.id);
+    return {
+      valid: false,
+      error: "Incorrect verification code. Maximum attempts reached. This code is now locked. Please request a new code.",
+      isLocked: true,
+      attemptsRemaining: 0,
+    };
+  }
+
+  return {
+    valid: false,
+    error: `Incorrect verification code. ${attemptsRemaining} attempt(s) remaining.`,
+    attemptsRemaining,
+  };
+}
+
+async function markOtpUsed(id: string) {
+  if (isPgAvailable && pool) {
+    try {
+      await pool.query("UPDATE otps SET is_used = TRUE WHERE id = $1", [id]);
+    } catch (err) {
+      console.error("DB error in markOtpUsed:", err);
+    }
+  } else {
+    const item = memoryStore.otps.get(id);
+    if (item) {
       item.is_used = true;
-      memoryStore.otps.set(key, item);
-      return true;
+      memoryStore.otps.set(id, item);
     }
   }
+}
 
-  return false;
+async function updateOtpAttempts(id: string, attempts: number) {
+  if (isPgAvailable && pool) {
+    try {
+      await pool.query("UPDATE otps SET attempts = $1 WHERE id = $2", [attempts, id]);
+    } catch (err) {
+      console.error("DB error in updateOtpAttempts:", err);
+    }
+  } else {
+    const item = memoryStore.otps.get(id);
+    if (item) {
+      item.attempts = attempts;
+      memoryStore.otps.set(id, item);
+    }
+  }
 }
